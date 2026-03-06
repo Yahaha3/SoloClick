@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, filedialog
 import json
 import uuid
 import threading
+import time
 import ctypes
 import sys
 import keyboard  # Used for key capture in settings
@@ -145,10 +146,13 @@ class MainApp:
         self.current_config_name = "未命名配置"
         self.injection_mode_map = {"自动": "auto", "系统": "winapi", "硬件": "hardware"}
         self.injection_mode_reverse_map = {v: k for k, v in self.injection_mode_map.items()}
+        self._f8_hotkey_ref = None
+        self._last_f8_toggle_ts = 0.0
         self.process = psutil.Process(os.getpid()) if psutil else None
         if self.process:
             self.process.cpu_percent(interval=None)
         self._init_ui()
+        self._bind_f8_shortcut()
         self._load_default_config_on_startup()
         self._start_monitor()
         self._center_window()
@@ -183,7 +187,27 @@ class MainApp:
         self._apply_theme(target)
 
     def _close_window(self):
+        if self._f8_hotkey_ref is not None:
+            try:
+                keyboard.remove_hotkey(self._f8_hotkey_ref)
+            except Exception:
+                pass
+            self._f8_hotkey_ref = None
         self.root.destroy()
+
+    def _bind_f8_shortcut(self):
+        self.root.bind_all("<F8>", lambda _e: self._toggle_hook_listener_hotkey())
+        try:
+            self._f8_hotkey_ref = keyboard.add_hotkey("f8", lambda: self.root.after(0, self._toggle_hook_listener_hotkey), suppress=False)
+        except Exception:
+            self._f8_hotkey_ref = None
+
+    def _toggle_hook_listener_hotkey(self):
+        now = time.perf_counter()
+        if now - self._last_f8_toggle_ts < 0.25:
+            return
+        self._last_f8_toggle_ts = now
+        self._toggle_hook_listener()
 
     def _center_window(self):
         self.root.update_idletasks()
@@ -253,6 +277,8 @@ class MainApp:
 
         self.mutex_var = tk.BooleanVar(value=False)
         tb.Checkbutton(cp_inner, text="独立模式（启动任务时自动关闭其他任务）", variable=self.mutex_var, command=self._toggle_mutex, bootstyle="round-toggle").pack(side=tk.LEFT)
+        self.debug_mode_var = tk.BooleanVar(value=True)
+        tb.Checkbutton(cp_inner, text="Debug模式", variable=self.debug_mode_var, command=self._toggle_debug_mode, bootstyle="round-toggle").pack(side=tk.LEFT, padx=(10, 0))
         tb.Label(cp_inner, text="注入模式", style="SectionTitle.TLabel").pack(side=tk.LEFT, padx=(14, 6))
         self.injection_mode_var = tk.StringVar(value="自动")
         self.injection_mode_cb = tb.Combobox(cp_inner, textvariable=self.injection_mode_var, values=["自动", "系统", "硬件"], width=7, state="readonly")
@@ -367,6 +393,9 @@ class MainApp:
     def _toggle_mutex(self):
         self.engine.set_mutex_mode(self.mutex_var.get())
 
+    def _toggle_debug_mode(self):
+        self._update_monitor_status()
+
     def _on_injection_mode_change(self, event=None):
         selected = self.injection_mode_var.get()
         mode = self.injection_mode_map.get(selected, "auto")
@@ -384,13 +413,18 @@ class MainApp:
                 running_count += 1
         hook_text = "监听中" if self.engine.is_hook_active() else "已暂停"
         inject_text = self.engine.get_injection_state()
+        debug_text = self.engine.get_driver_release_debug()
         if self.process:
             cpu_usage = self.process.cpu_percent(interval=None)
             mem_usage = self.process.memory_info().rss / (1024 * 1024)
             perf_text = f"CPU: {cpu_usage:.1f}% | 内存: {mem_usage:.1f}MB"
         else:
             perf_text = "CPU: -- | 内存: --"
-        self.monitor_var.set(f"监听: {hook_text} | 运行任务: {running_count} | 注入: {inject_text} | {perf_text}")
+        base_text = f"监听: {hook_text} | 运行任务: {running_count} | 注入: {inject_text} | {perf_text}"
+        if self.debug_mode_var.get():
+            self.monitor_var.set(f"{base_text} | {debug_text}")
+        else:
+            self.monitor_var.set(base_text)
 
     def _get_app_dir(self):
         if getattr(sys, "frozen", False):
@@ -417,6 +451,8 @@ class MainApp:
         theme_mode = "dark" if self.current_theme == "darkly" else "light"
         return {
             "mutex_mode": self.mutex_var.get(),
+            "independent_mode": self.mutex_var.get(),
+            "debug_mode": self.debug_mode_var.get(),
             "theme_mode": theme_mode,
             "injection_mode": self.engine.get_injection_mode(),
             "tasks": self.tasks_data
@@ -425,8 +461,10 @@ class MainApp:
     def _load_config_from_path(self, path, show_success=True):
         with open(path, 'r') as f:
             config = json.load(f)
-        self.mutex_var.set(config.get("mutex_mode", False))
+        independent_mode = config.get("independent_mode", config.get("mutex_mode", False))
+        self.mutex_var.set(bool(independent_mode))
         self._toggle_mutex()
+        self.debug_mode_var.set(bool(config.get("debug_mode", True)))
         theme_mode = config.get("theme_mode")
         if theme_mode == "dark":
             self._apply_theme("darkly")
@@ -446,6 +484,7 @@ class MainApp:
         filename = os.path.basename(path)
         self.current_config_name = os.path.splitext(filename)[0]
         self._update_title()
+        self._update_monitor_status()
         if show_success:
             messagebox.showinfo("成功", "配置已加载。")
 
