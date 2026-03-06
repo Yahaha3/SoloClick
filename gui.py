@@ -3,7 +3,9 @@ from tkinter import ttk, messagebox, filedialog
 import json
 import uuid
 import threading
+import time
 import ctypes
+import sys
 import keyboard  # Used for key capture in settings
 from core import EngineController
 import os
@@ -135,16 +137,23 @@ class MainApp:
         self.root.geometry("760x600")
         self.root.overrideredirect(False)
         self.root.protocol("WM_DELETE_WINDOW", self._close_window)
+        self._apply_app_icon()
         self.current_theme = "darkly"
         self.style = tb.Style(theme=self.current_theme)
         self._setup_styles()
         self.engine = EngineController()
         self.tasks_data = []
         self.current_config_name = "未命名配置"
+        self.injection_mode_map = {"自动": "auto", "系统": "winapi", "硬件": "hardware"}
+        self.injection_mode_reverse_map = {v: k for k, v in self.injection_mode_map.items()}
+        self._f8_hotkey_ref = None
+        self._last_f8_toggle_ts = 0.0
         self.process = psutil.Process(os.getpid()) if psutil else None
         if self.process:
             self.process.cpu_percent(interval=None)
         self._init_ui()
+        self._bind_f8_shortcut()
+        self._load_default_config_on_startup()
         self._start_monitor()
         self._center_window()
 
@@ -178,7 +187,27 @@ class MainApp:
         self._apply_theme(target)
 
     def _close_window(self):
+        if self._f8_hotkey_ref is not None:
+            try:
+                keyboard.remove_hotkey(self._f8_hotkey_ref)
+            except Exception:
+                pass
+            self._f8_hotkey_ref = None
         self.root.destroy()
+
+    def _bind_f8_shortcut(self):
+        self.root.bind_all("<F8>", lambda _e: self._toggle_hook_listener_hotkey())
+        try:
+            self._f8_hotkey_ref = keyboard.add_hotkey("f8", lambda: self.root.after(0, self._toggle_hook_listener_hotkey), suppress=False)
+        except Exception:
+            self._f8_hotkey_ref = None
+
+    def _toggle_hook_listener_hotkey(self):
+        now = time.perf_counter()
+        if now - self._last_f8_toggle_ts < 0.25:
+            return
+        self._last_f8_toggle_ts = now
+        self._toggle_hook_listener()
 
     def _center_window(self):
         self.root.update_idletasks()
@@ -212,6 +241,7 @@ class MainApp:
         tb.Label(action_inner, text="配置", style="SectionTitle.TLabel").pack(side=tk.LEFT, padx=(0, 8))
         tb.Button(action_inner, text="导入", command=self._import_config, bootstyle="secondary-outline", width=7).pack(side=tk.LEFT, padx=3)
         tb.Button(action_inner, text="导出", command=self._export_config, bootstyle="secondary-outline", width=7).pack(side=tk.LEFT, padx=3)
+        tb.Button(action_inner, text="设默认", command=self._save_default_config, bootstyle="secondary-outline", width=7).pack(side=tk.LEFT, padx=3)
 
         list_card = tb.Frame(main_container, borderwidth=1, relief="solid")
         list_card.pack(fill=tk.BOTH, expand=True)
@@ -247,6 +277,13 @@ class MainApp:
 
         self.mutex_var = tk.BooleanVar(value=False)
         tb.Checkbutton(cp_inner, text="独立模式（启动任务时自动关闭其他任务）", variable=self.mutex_var, command=self._toggle_mutex, bootstyle="round-toggle").pack(side=tk.LEFT)
+        self.debug_mode_var = tk.BooleanVar(value=True)
+        tb.Checkbutton(cp_inner, text="Debug模式", variable=self.debug_mode_var, command=self._toggle_debug_mode, bootstyle="round-toggle").pack(side=tk.LEFT, padx=(10, 0))
+        tb.Label(cp_inner, text="注入模式", style="SectionTitle.TLabel").pack(side=tk.LEFT, padx=(14, 6))
+        self.injection_mode_var = tk.StringVar(value="自动")
+        self.injection_mode_cb = tb.Combobox(cp_inner, textvariable=self.injection_mode_var, values=["自动", "系统", "硬件"], width=7, state="readonly")
+        self.injection_mode_cb.pack(side=tk.LEFT)
+        self.injection_mode_cb.bind("<<ComboboxSelected>>", self._on_injection_mode_change)
 
         right_panel = tb.Frame(cp_inner)
         right_panel.pack(side=tk.RIGHT)
@@ -356,6 +393,15 @@ class MainApp:
     def _toggle_mutex(self):
         self.engine.set_mutex_mode(self.mutex_var.get())
 
+    def _toggle_debug_mode(self):
+        self._update_monitor_status()
+
+    def _on_injection_mode_change(self, event=None):
+        selected = self.injection_mode_var.get()
+        mode = self.injection_mode_map.get(selected, "auto")
+        self.engine.set_injection_mode(mode)
+        self._update_monitor_status()
+
     def _update_title(self):
         self.root.title(f"SoloKeyClicker - {self.current_config_name}")
         self.status_bar_var.set(f"当前配置: {self.current_config_name}")
@@ -366,26 +412,96 @@ class MainApp:
             if self.engine.get_task_status(task['id']):
                 running_count += 1
         hook_text = "监听中" if self.engine.is_hook_active() else "已暂停"
+        inject_text = self.engine.get_injection_state()
+        debug_text = self.engine.get_driver_release_debug()
         if self.process:
             cpu_usage = self.process.cpu_percent(interval=None)
             mem_usage = self.process.memory_info().rss / (1024 * 1024)
             perf_text = f"CPU: {cpu_usage:.1f}% | 内存: {mem_usage:.1f}MB"
         else:
             perf_text = "CPU: -- | 内存: --"
-        self.monitor_var.set(f"监听: {hook_text} | 运行任务: {running_count} | {perf_text}")
+        base_text = f"监听: {hook_text} | 运行任务: {running_count} | 注入: {inject_text} | {perf_text}"
+        if self.debug_mode_var.get():
+            self.monitor_var.set(f"{base_text} | {debug_text}")
+        else:
+            self.monitor_var.set(base_text)
+
+    def _get_app_dir(self):
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def _get_resource_path(self, filename):
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            return os.path.join(sys._MEIPASS, filename)
+        return os.path.join(self._get_app_dir(), filename)
+
+    def _apply_app_icon(self):
+        icon_path = self._get_resource_path("icon.ico")
+        if os.path.exists(icon_path):
+            try:
+                self.root.iconbitmap(default=icon_path)
+            except:
+                pass
+
+    def _get_default_config_path(self):
+        return os.path.join(self._get_app_dir(), "default_config.json")
+
+    def _build_config_payload(self):
+        theme_mode = "dark" if self.current_theme == "darkly" else "light"
+        return {
+            "mutex_mode": self.mutex_var.get(),
+            "independent_mode": self.mutex_var.get(),
+            "debug_mode": self.debug_mode_var.get(),
+            "theme_mode": theme_mode,
+            "injection_mode": self.engine.get_injection_mode(),
+            "tasks": self.tasks_data
+        }
+
+    def _load_config_from_path(self, path, show_success=True):
+        with open(path, 'r') as f:
+            config = json.load(f)
+        independent_mode = config.get("independent_mode", config.get("mutex_mode", False))
+        self.mutex_var.set(bool(independent_mode))
+        self._toggle_mutex()
+        self.debug_mode_var.set(bool(config.get("debug_mode", True)))
+        theme_mode = config.get("theme_mode")
+        if theme_mode == "dark":
+            self._apply_theme("darkly")
+        elif theme_mode == "light":
+            self._apply_theme("cosmo")
+        injection_mode = config.get("injection_mode", "auto")
+        self.engine.set_injection_mode(injection_mode)
+        self.injection_mode_var.set(self.injection_mode_reverse_map.get(injection_mode, "自动"))
+        self.engine.stop_all()
+        self.tasks_data = []
+        for task in config.get("tasks", []):
+            if 'id' not in task:
+                task['id'] = str(uuid.uuid4())
+            self.tasks_data.append(task)
+            self._sync_task_to_engine(task)
+        self._refresh_list()
+        filename = os.path.basename(path)
+        self.current_config_name = os.path.splitext(filename)[0]
+        self._update_title()
+        self._update_monitor_status()
+        if show_success:
+            messagebox.showinfo("成功", "配置已加载。")
+
+    def _load_default_config_on_startup(self):
+        path = self._get_default_config_path()
+        if os.path.exists(path):
+            try:
+                self._load_config_from_path(path, show_success=False)
+            except Exception as e:
+                messagebox.showwarning("警告", f"默认配置加载失败: {e}")
 
     def _export_config(self):
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Config", "*.json")])
         if path:
-            theme_mode = "dark" if self.current_theme == "darkly" else "light"
-            config = {
-                "mutex_mode": self.mutex_var.get(),
-                "theme_mode": theme_mode,
-                "tasks": self.tasks_data
-            }
             try:
                 with open(path, 'w') as f:
-                    json.dump(config, f, indent=2)
+                    json.dump(self._build_config_payload(), f, indent=2)
                 
                 # Update config name display
                 filename = os.path.basename(path)
@@ -400,40 +516,18 @@ class MainApp:
         path = filedialog.askopenfilename(filetypes=[("JSON Config", "*.json")])
         if path:
             try:
-                with open(path, 'r') as f:
-                    config = json.load(f)
-                
-                # Apply settings
-                self.mutex_var.set(config.get("mutex_mode", False))
-                self._toggle_mutex()
-                theme_mode = config.get("theme_mode")
-                if theme_mode == "dark":
-                    self._apply_theme("darkly")
-                elif theme_mode == "light":
-                    self._apply_theme("cosmo")
-                
-                # Stop all existing
-                self.engine.stop_all()
-                self.tasks_data = []
-                
-                # Load tasks
-                for task in config.get("tasks", []):
-                    # Validate
-                    if 'id' not in task:
-                        task['id'] = str(uuid.uuid4())
-                    self.tasks_data.append(task)
-                    self._sync_task_to_engine(task)
-                
-                self._refresh_list()
-                
-                # Update config name display
-                filename = os.path.basename(path)
-                self.current_config_name = os.path.splitext(filename)[0]
-                self._update_title()
-
-                messagebox.showinfo("成功", "配置已加载。")
+                self._load_config_from_path(path, show_success=True)
             except Exception as e:
                 messagebox.showerror("错误", f"加载配置失败: {e}")
+
+    def _save_default_config(self):
+        path = self._get_default_config_path()
+        try:
+            with open(path, 'w') as f:
+                json.dump(self._build_config_payload(), f, indent=2)
+            messagebox.showinfo("成功", f"已设为默认配置: {path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"设置默认配置失败: {e}")
 
     def _start_monitor(self):
         # Periodically refresh status (e.g. every 500ms)

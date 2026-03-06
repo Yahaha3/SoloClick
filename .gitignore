@@ -41,3 +41,4 @@ app.*.symbols
 app.*.map.json
 
 /_pycache_/
+/dist/
